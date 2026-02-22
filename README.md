@@ -1,6 +1,8 @@
-# ComfyUI MonarchAttention patch node
+# ComfyUI MonarchAttention node (model override)
 
-This custom node patches ComfyUI's global attention entry points to use **MonarchAttention** for **self-attention** only (where Q/K/V have the same sequence length). Cross-attention is left untouched.
+This custom node enables **MonarchAttention** for **self-attention** only (where Q/K/V have the same sequence length) by setting a **model-level** `optimized_attention_override` in `model_options["transformer_options"]`.
+
+That means it only affects the **MODEL branch** you connect it to (SDXL UNet branch, WAN branch, etc.), rather than patching ComfyUI globally.
 
 ## Install
 
@@ -10,24 +12,22 @@ This custom node patches ComfyUI's global attention entry points to use **Monarc
 
 2. Vendor the MonarchAttention repo into this custom node (no env vars needed).
 
-   The node expects a directory containing `ma/` at one of the following paths:
+   Copy (or git clone) the MonarchAttention repo so that `ma/` ends up at one of:
 
    - `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch_attention/ma/`
    - `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch-attention/ma/`
-
-   The simplest way is to copy (or git clone) the MonarchAttention repo into:
-   `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch_attention/`
-
-   Make sure the *final* layout contains `ma/` directly under that folder.
 
 3. Restart ComfyUI.
 
 ## Use
 
-- Add **Enable MonarchAttention (self-attn)** before your sampler.
-- If something breaks, add **Disable MonarchAttention** (or toggle enable=false) and rerun.
+- Put **Enable MonarchAttention (self-attn)** on the **MODEL line** before it goes into your sampler.
+- For multi-model workflows (e.g. WAN high/low models), place it on **each** model branch you want patched.
+- If something breaks, use **Disable MonarchAttention** (or set `enable=false`) on that same model branch.
 
 ## Notes
 
-- Only works for self-attention (square attention). It will automatically fall back to ComfyUI's original attention for cross-attention or unsupported tensor shapes.
-- `impl=auto` prefers `triton` if the repo registers it; otherwise uses `torch`.
+- Only applies to self-attention (square attention). It falls back to the previous attention path for cross-attention or unsupported shapes.
+- If the model already had an `optimized_attention_override` (e.g. SageAttention/FlashAttention), this node will **chain** it as a fallback and restore it when disabled.
+- Mask support is conservative (only simple boolean key-padding masks). If a call uses an unsupported mask type/shape, it will fall back.
+- `impl=auto` prefers `triton` if available; otherwise uses `torch`.
