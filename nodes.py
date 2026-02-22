@@ -12,69 +12,66 @@ import torch
 # Import helper (external MonarchAttention repo)
 # ------------------------------
 
-def _try_add_monarch_path() -> Optional[str]:
-    """Try to make `import ma` work by adding a user-provided path to sys.path.
+def _ensure_vendored_monarch_path() -> str:
+    """Ensure `import ma` works by adding a vendored MonarchAttention repo to sys.path.
 
-    Expected directory contains the `ma/` package from the MonarchAttention repo.
+    This custom node expects the MonarchAttention repo to be bundled under:
+
+        comfyui_monarch_attention/third_party/...
+
+    The directory we add to sys.path must directly contain the `ma/` package.
     """
-    candidates = []
-
-    env = os.environ.get("MONARCH_ATTENTION_PATH") or os.environ.get("MONARCHATTN_PATH")
-    if env:
-        candidates.append(env)
-
-    # Common layouts if the repo is copied next to this custom node
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates += [
-        os.path.join(here, "monarch-attention-main"),
+
+    # Preferred layout:
+    #   comfyui_monarch_attention/third_party/monarch_attention/ma/...
+    candidates = [
+        os.path.join(here, "third_party", "monarch_attention"),
+        os.path.join(here, "third_party", "monarch-attention"),
+        # Common zip/github download layouts (nested repo folder names)
         os.path.join(here, "third_party", "monarch-attention-main"),
         os.path.join(here, "third_party", "monarch-attention-main", "monarch-attention-main"),
+        os.path.join(here, "third_party", "monarch_attention_main"),
     ]
 
     for p in candidates:
-        if not p:
-            continue
         if os.path.isdir(os.path.join(p, "ma")):
             if p not in sys.path:
                 sys.path.insert(0, p)
             return p
-    return None
+
+    raise ImportError(
+        "MonarchAttention not found (vendored dependency missing).\n\n"
+        "Expected one of these to exist and contain a `ma/` folder:\n"
+        f"  - {os.path.join(here, 'third_party', 'monarch_attention')}\n"
+        f"  - {os.path.join(here, 'third_party', 'monarch-attention')}\n"
+        "If you downloaded a GitHub zip, copy the *inner* folder that contains `ma/` into one of the paths above.\n"
+    )
 
 
 def _import_monarch_attention():
-    """Import MonarchAttention module from the external repo.
+    """Import MonarchAttention module from the vendored repo.
 
     Returns (MonarchAttention, PadType, available_impls)
     """
     try:
         from ma.monarch_attention import MonarchAttention, PadType  # type: ignore
-
         from ma import monarch_attention as ma_mod  # type: ignore
-
-        impls = []
-        try:
-            impls = sorted(getattr(ma_mod, "_IMPLEMENTATIONS", {}).keys())
-        except Exception:
-            impls = []
-        return MonarchAttention, PadType, impls
-    except Exception:
-        added = _try_add_monarch_path()
-        if not added:
-            raise ImportError(
-                "Could not import `ma` (MonarchAttention).\n"
-                "Set env var MONARCH_ATTENTION_PATH to the directory that contains the `ma/` folder, "
-                "then restart ComfyUI."
-            )
+    except ModuleNotFoundError as e:
+        # Only attempt vendored path injection when `ma` is missing.
+        # If `ma` exists but errors during import, let that error surface.
+        if getattr(e, "name", None) not in ("ma", "ma.monarch_attention"):
+            raise
+        _ensure_vendored_monarch_path()
         from ma.monarch_attention import MonarchAttention, PadType  # type: ignore
-
         from ma import monarch_attention as ma_mod  # type: ignore
 
+    impls: list[str] = []
+    try:
+        impls = sorted(getattr(ma_mod, "_IMPLEMENTATIONS", {}).keys())
+    except Exception:
         impls = []
-        try:
-            impls = sorted(getattr(ma_mod, "_IMPLEMENTATIONS", {}).keys())
-        except Exception:
-            impls = []
-        return MonarchAttention, PadType, impls
+    return MonarchAttention, PadType, impls
 
 
 # ------------------------------

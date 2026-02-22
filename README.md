@@ -8,19 +8,17 @@ This custom node patches ComfyUI's global attention entry points to use **Monarc
 
    `ComfyUI/custom_nodes/comfyui_monarch_attention/`
 
-2. Make the MonarchAttention repo importable (it must contain a top-level `ma/` directory):
+2. Vendor the MonarchAttention repo into this custom node (no env vars needed).
 
-   **Option A (recommended):** set an env var and restart ComfyUI
+   The node expects a directory containing `ma/` at one of the following paths:
 
-   - Windows (PowerShell):
-     - `setx MONARCH_ATTENTION_PATH "D:\\path\\to\\monarch-attention-main\\monarch-attention-main"`
-   - Linux:
-     - `export MONARCH_ATTENTION_PATH=/path/to/monarch-attention-main/monarch-attention-main`
+   - `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch_attention/ma/`
+   - `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch-attention/ma/`
 
-   **Option B:** copy the repo next to this node (no env var)
+   The simplest way is to copy (or git clone) the MonarchAttention repo into:
+   `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch_attention/`
 
-   - Place the repo directory at:
-     - `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch-attention-main/monarch-attention-main/`
+   Make sure the *final* layout contains `ma/` directly under that folder.
 
 3. Restart ComfyUI.
 
