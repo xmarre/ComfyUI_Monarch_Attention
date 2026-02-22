@@ -83,6 +83,8 @@ class _PatchConfig:
     min_seq_len: int
     max_seq_len: int
     verbose: bool
+    strict: bool
+    print_debug: bool
 
 
 _STATE: dict[str, Any] = {"last_status": "disabled"}
@@ -164,47 +166,57 @@ def _build_attention_override(cfg: _PatchConfig, fallback_override: Optional[Cal
         # Fall back safely
         impl = "torch"
 
+    resolved_impl = impl
     pad_type = PadType.pre if cfg.pad_type == "pre" else PadType.post
 
     monarch = MonarchAttention(
         block_size=int(cfg.block_size),
         num_steps=int(cfg.num_steps),
         pad_type=pad_type,
-        impl=impl,
+        impl=resolved_impl,
     )
 
+    stats = {"banner": False, "used": 0, "rejected": 0}
+
+    def _dbg(msg: str):
+        if cfg.print_debug:
+            print(msg)
+
     def attention_override(func: Callable, *args, **kwargs):
-        # Called from ComfyUI's wrap_attn wrapper as:
-        #   transformer_options["optimized_attention_override"](func, *args, **kwargs)
-        # where func is the *original* attention function (e.g. attention_basic).
-        # IMPORTANT: kwargs contains the recursion guard key; don't forward it.
-        kwargs.pop("_inside_attn_wrapper", None)
+        if cfg.print_debug and not stats["banner"]:
+            stats["banner"] = True
+            _dbg(
+                "[MonarchAttention] override active | "
+                f"impl={cfg.impl}->{resolved_impl} bs={cfg.block_size} steps={cfg.num_steps} "
+                f"pad={cfg.pad_type} n=[{cfg.min_seq_len},{cfg.max_seq_len}] strict={cfg.strict}"
+            )
 
         try:
             if len(args) < 4:
-                if fallback_override is not None:
-                    return fallback_override(func, *args, **kwargs)
-                return func(*args, **kwargs)
+                raise RuntimeError(f"bad signature: len(args)={len(args)} (<4)")
 
             q, k, v, heads = args[0], args[1], args[2], args[3]
+            # Preserve positional + alternate kwarg forms for mask.
             mask = kwargs.get("mask", None)
+            if mask is None:
+                mask = kwargs.get("attn_mask", None)
+            if mask is None and len(args) >= 5:
+                mask = args[4]
             attn_precision = kwargs.get("attn_precision", None)
             skip_reshape = bool(kwargs.get("skip_reshape", False))
             skip_output_reshape = bool(kwargs.get("skip_output_reshape", False))
 
             if not (torch.is_tensor(q) and torch.is_tensor(k) and torch.is_tensor(v)):
-                if fallback_override is not None:
-                    return fallback_override(func, *args, **kwargs)
-                return func(*args, **kwargs)
+                raise RuntimeError(f"qkv not tensors: q={type(q)} k={type(k)} v={type(v)}")
             if not isinstance(heads, int) or heads <= 0:
-                if fallback_override is not None:
-                    return fallback_override(func, *args, **kwargs)
-                return func(*args, **kwargs)
+                raise RuntimeError(f"invalid heads={heads!r}")
 
             if not _should_use_monarch_self_attn(q, k, v, heads, cfg, skip_reshape, attn_precision):
-                if fallback_override is not None:
-                    return fallback_override(func, *args, **kwargs)
-                return func(*args, **kwargs)
+                raise RuntimeError(
+                    "shape/gating rejected: "
+                    f"q={tuple(q.shape)} k={tuple(k.shape)} v={tuple(v.shape)} "
+                    f"heads={heads} skip_reshape={skip_reshape} attn_precision={attn_precision}"
+                )
 
             b = int(q.shape[0])
 
@@ -221,9 +233,7 @@ def _build_attention_override(cfg: _PatchConfig, fallback_override: Optional[Cal
                 dim = int(q.shape[-1])
                 dim_head = dim // heads
                 if dim_head * heads != dim:
-                    if fallback_override is not None:
-                        return fallback_override(func, *args, **kwargs)
-                    return func(*args, **kwargs)
+                    raise RuntimeError(f"embed dim not divisible by heads: dim={dim} heads={heads}")
                 q_bhnd = q.view(b, n, heads, dim_head).permute(0, 2, 1, 3).contiguous()
                 k_bhnd = k.view(b, n, heads, dim_head).permute(0, 2, 1, 3).contiguous()
                 v_bhnd = v.view(b, n, heads, dim_head).permute(0, 2, 1, 3).contiguous()
@@ -232,9 +242,7 @@ def _build_attention_override(cfg: _PatchConfig, fallback_override: Optional[Cal
             mask_bool = None
             if mask is not None:
                 if not torch.is_tensor(mask):
-                    if fallback_override is not None:
-                        return fallback_override(func, *args, **kwargs)
-                    return func(*args, **kwargs)
+                    raise RuntimeError(f"mask not tensor: {type(mask)}")
 
                 # bool mask is typically [B, Nk] (or [1, Nk])
                 if mask.dim() == 2 and mask.shape[1] == n and mask.shape[0] in (1, b):
@@ -242,14 +250,12 @@ def _build_attention_override(cfg: _PatchConfig, fallback_override: Optional[Cal
                         mask = mask.expand(b, -1)
                     mask_bool = _as_bool_mask(mask)
                     if mask_bool is None:
-                        if fallback_override is not None:
-                            return fallback_override(func, *args, **kwargs)
-                        return func(*args, **kwargs)
+                        raise RuntimeError(f"mask dtype unsupported: dtype={mask.dtype}")
                 else:
-                    # Unsupported mask shape/type; fall back.
-                    if fallback_override is not None:
-                        return fallback_override(func, *args, **kwargs)
-                    return func(*args, **kwargs)
+                    raise RuntimeError(
+                        "unsupported mask shape for MonarchAttention (expects [B,N] key-padding). "
+                        f"mask.shape={tuple(mask.shape)} dtype={mask.dtype} n={n} b={b}"
+                    )
 
             t0 = _now_ms() if cfg.verbose else 0
             out_bhnd = monarch(q_bhnd, k_bhnd, v_bhnd, attention_mask=mask_bool)
@@ -260,15 +266,26 @@ def _build_attention_override(cfg: _PatchConfig, fallback_override: Optional[Cal
             else:
                 out = out_bhnd.permute(0, 2, 1, 3).reshape(b, -1, heads * dim_head)
 
+            stats["used"] += 1
+            if cfg.print_debug and stats["used"] <= 5:
+                _dbg(f"[MonarchAttention] USED | n={n} heads={heads} mask={'yes' if mask is not None else 'no'}")
+
             if cfg.verbose:
                 dt = _now_ms() - t0
-                _STATE["last_status"] = (
-                    f"monarch(model-override, {cfg.impl}->{impl}) used: n={n} h={heads} bs={cfg.block_size} "
+                msg = (
+                    f"monarch(model-override, {cfg.impl}->{resolved_impl}) used: n={n} h={heads} bs={cfg.block_size} "
                     f"steps={cfg.num_steps} pad={cfg.pad_type} | {dt}ms"
                 )
+                _STATE["last_status"] = msg
+                _dbg(f"[MonarchAttention] {msg}")
 
             return out
-        except Exception:
+        except Exception as e:
+            stats["rejected"] += 1
+            if cfg.print_debug and stats["rejected"] <= 20:
+                _dbg(f"[MonarchAttention] REJECT | {e}")
+            if cfg.strict:
+                raise
             if fallback_override is not None:
                 return fallback_override(func, *args, **kwargs)
             return func(*args, **kwargs)
@@ -378,6 +395,8 @@ class MonarchAttentionEnable:
                 "min_seq_len": ("INT", {"default": 256, "min": 1, "max": 262144}),
                 "max_seq_len": ("INT", {"default": 4096, "min": 1, "max": 262144}),
                 "verbose": ("BOOLEAN", {"default": False}),
+                "strict": ("BOOLEAN", {"default": True}),
+                "print_debug": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -397,6 +416,8 @@ class MonarchAttentionEnable:
         min_seq_len: int,
         max_seq_len: int,
         verbose: bool,
+        strict: bool,
+        print_debug: bool,
     ):
         if not enable:
             model2, status = _remove_model_override(model)
@@ -410,6 +431,8 @@ class MonarchAttentionEnable:
             min_seq_len=int(min_seq_len),
             max_seq_len=int(max_seq_len),
             verbose=bool(verbose),
+            strict=bool(strict),
+            print_debug=bool(print_debug),
         )
         model2, status = _apply_model_override(model, cfg)
         return (model2, status)
