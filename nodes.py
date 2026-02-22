@@ -1,37 +1,33 @@
 import os
 import sys
 import time
-import types
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 
 import torch
 
 
 # ------------------------------
-# Import helper (external MonarchAttention repo)
+# Import helper (vendored MonarchAttention repo)
 # ------------------------------
 
 def _ensure_vendored_monarch_path() -> str:
     """Ensure `import ma` works by adding a vendored MonarchAttention repo to sys.path.
 
-    This custom node expects the MonarchAttention repo to be bundled under:
+    Expected layout (recommended):
 
-        comfyui_monarch_attention/third_party/...
+        comfyui_monarch_attention/third_party/monarch_attention/ma/...
 
     The directory we add to sys.path must directly contain the `ma/` package.
     """
     here = os.path.dirname(os.path.abspath(__file__))
 
-    # Preferred layout:
-    #   comfyui_monarch_attention/third_party/monarch_attention/ma/...
     candidates = [
         os.path.join(here, "third_party", "monarch_attention"),
         os.path.join(here, "third_party", "monarch-attention"),
-        # Common zip/github download layouts (nested repo folder names)
+        # Common GitHub zip layout (nested repo folder names)
         os.path.join(here, "third_party", "monarch-attention-main"),
         os.path.join(here, "third_party", "monarch-attention-main", "monarch-attention-main"),
-        os.path.join(here, "third_party", "monarch_attention_main"),
     ]
 
     for p in candidates:
@@ -58,8 +54,7 @@ def _import_monarch_attention():
         from ma.monarch_attention import MonarchAttention, PadType  # type: ignore
         from ma import monarch_attention as ma_mod  # type: ignore
     except ModuleNotFoundError as e:
-        # Only attempt vendored path injection when `ma` is missing.
-        # If `ma` exists but errors during import, let that error surface.
+        # Only try vendored-path injection when the module isn't found.
         if getattr(e, "name", None) not in ("ma", "ma.monarch_attention"):
             raise
         _ensure_vendored_monarch_path()
@@ -90,12 +85,7 @@ class _PatchConfig:
     verbose: bool
 
 
-_PATCH_STATE: dict[str, Any] = {
-    "enabled": False,
-    "orig": {},  # name -> callable
-    "config": None,
-    "last_status": "disabled",
-}
+_STATE: dict[str, Any] = {"last_status": "disabled"}
 
 
 def _now_ms() -> int:
@@ -111,46 +101,60 @@ def _as_bool_mask(mask: torch.Tensor) -> Optional[torch.Tensor]:
     return None
 
 
-def _reshape_to_bhnd(x: torch.Tensor, heads: Optional[int]) -> Optional[Tuple[torch.Tensor, int, int]]:
-    """Return (x_bhnd, batch, heads)."""
-    if x.dim() == 4:
-        b, h, n, d = x.shape
-        return x, b, h
-    if x.dim() == 3:
-        bh, n, d = x.shape
-        if not heads or heads <= 0 or (bh % heads) != 0:
-            return None
-        b = bh // heads
-        return x.view(b, heads, n, d), b, heads
-    return None
+# ------------------------------
+# Model-level attention override (branch-specific)
+# ------------------------------
 
 
-def _reshape_back(y_bhnd: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
-    if original.dim() == 4:
-        return y_bhnd
-    if original.dim() == 3:
-        b, h, n, d = y_bhnd.shape
-        return y_bhnd.reshape(b * h, n, d)
-    return y_bhnd
+def _should_use_monarch_self_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    cfg: _PatchConfig,
+    skip_reshape: bool,
+    attn_precision: Optional[torch.dtype],
+) -> bool:
+    # self-attn only
+    try:
+        if skip_reshape:
+            # q,k,v are expected to be [B, H, N, Dh]
+            if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+                return False
+            if q.shape[1] != heads or k.shape[1] != heads or v.shape[1] != heads:
+                return False
+            # Dh must match
+            if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
+                return False
+            nq = int(q.shape[2])
+            nk = int(k.shape[2])
+            nv = int(v.shape[2])
+        else:
+            # q,k,v are expected to be [B, N, H*Dh]
+            if q.dim() != 3 or k.dim() != 3 or v.dim() != 3:
+                return False
+            nq = int(q.shape[1])
+            nk = int(k.shape[1])
+            nv = int(v.shape[1])
+            if (q.shape[-1] % heads) != 0 or (k.shape[-1] % heads) != 0 or (v.shape[-1] % heads) != 0:
+                return False
 
+        if nq != nk or nk != nv:
+            return False
 
-def _should_use_monarch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: _PatchConfig) -> bool:
-    # Self-attention only
-    if q.shape[-2] != k.shape[-2] or k.shape[-2] != v.shape[-2]:
+        if nq < cfg.min_seq_len or nq > cfg.max_seq_len:
+            return False
+
+        # If caller forced FP32 attention, keep original path (Monarch impl may not match).
+        if attn_precision == torch.float32:
+            return False
+
+        return True
+    except Exception:
         return False
 
-    n = int(q.shape[-2])
-    if n < cfg.min_seq_len or n > cfg.max_seq_len:
-        return False
 
-    # Head dim must be >0
-    if q.shape[-1] <= 0:
-        return False
-
-    return True
-
-
-def _build_wrapper(orig_fn: Callable, cfg: _PatchConfig) -> Callable:
+def _build_attention_override(cfg: _PatchConfig, fallback_override: Optional[Callable]) -> Callable:
     MonarchAttention, PadType, impls = _import_monarch_attention()
 
     impl = cfg.impl
@@ -169,145 +173,190 @@ def _build_wrapper(orig_fn: Callable, cfg: _PatchConfig) -> Callable:
         impl=impl,
     )
 
-    def wrapped(*args, **kwargs):
-        # Try to map ComfyUI's attention signature(s) to (q, k, v, heads, mask)
-        try:
-            if len(args) < 3:
-                return orig_fn(*args, **kwargs)
+    def attention_override(func: Callable, *args, **kwargs):
+        # Called from ComfyUI's wrap_attn wrapper as:
+        #   transformer_options["optimized_attention_override"](func, *args, **kwargs)
+        # where func is the *original* attention function (e.g. attention_basic).
+        # IMPORTANT: kwargs contains the recursion guard key; don't forward it.
+        kwargs.pop("_inside_attn_wrapper", None)
 
-            q = args[0]
-            k = args[1]
-            v = args[2]
+        try:
+            if len(args) < 4:
+                if fallback_override is not None:
+                    return fallback_override(func, *args, **kwargs)
+                return func(*args, **kwargs)
+
+            q, k, v, heads = args[0], args[1], args[2], args[3]
+            mask = kwargs.get("mask", None)
+            attn_precision = kwargs.get("attn_precision", None)
+            skip_reshape = bool(kwargs.get("skip_reshape", False))
+            skip_output_reshape = bool(kwargs.get("skip_output_reshape", False))
 
             if not (torch.is_tensor(q) and torch.is_tensor(k) and torch.is_tensor(v)):
-                return orig_fn(*args, **kwargs)
+                if fallback_override is not None:
+                    return fallback_override(func, *args, **kwargs)
+                return func(*args, **kwargs)
+            if not isinstance(heads, int) or heads <= 0:
+                if fallback_override is not None:
+                    return fallback_override(func, *args, **kwargs)
+                return func(*args, **kwargs)
 
-            heads = kwargs.get("heads", None)
-            if heads is None and len(args) >= 4 and isinstance(args[3], int):
-                heads = args[3]
+            if not _should_use_monarch_self_attn(q, k, v, heads, cfg, skip_reshape, attn_precision):
+                if fallback_override is not None:
+                    return fallback_override(func, *args, **kwargs)
+                return func(*args, **kwargs)
 
-            # Try common mask kwarg names
-            mask = kwargs.get("mask", None)
-            if mask is None:
-                mask = kwargs.get("attn_mask", None)
-            if mask is None and len(args) >= 5 and torch.is_tensor(args[4]):
-                mask = args[4]
+            b = int(q.shape[0])
 
-            q_r = _reshape_to_bhnd(q, heads)
-            k_r = _reshape_to_bhnd(k, heads)
-            v_r = _reshape_to_bhnd(v, heads)
-            if not q_r or not k_r or not v_r:
-                return orig_fn(*args, **kwargs)
+            if skip_reshape:
+                # [B, H, N, Dh]
+                q_bhnd = q
+                k_bhnd = k
+                v_bhnd = v
+                n = int(q.shape[2])
+                dim_head = int(q.shape[-1])
+            else:
+                # [B, N, H*Dh] -> [B, H, N, Dh]
+                n = int(q.shape[1])
+                dim = int(q.shape[-1])
+                dim_head = dim // heads
+                if dim_head * heads != dim:
+                    if fallback_override is not None:
+                        return fallback_override(func, *args, **kwargs)
+                    return func(*args, **kwargs)
+                q_bhnd = q.view(b, n, heads, dim_head).permute(0, 2, 1, 3).contiguous()
+                k_bhnd = k.view(b, n, heads, dim_head).permute(0, 2, 1, 3).contiguous()
+                v_bhnd = v.view(b, n, heads, dim_head).permute(0, 2, 1, 3).contiguous()
 
-            q_bhnd, b, h = q_r
-            k_bhnd, b2, h2 = k_r
-            v_bhnd, b3, h3 = v_r
-
-            if b != b2 or b != b3 or h != h2 or h != h3:
-                return orig_fn(*args, **kwargs)
-
-            if not _should_use_monarch(q_bhnd, k_bhnd, v_bhnd, cfg):
-                return orig_fn(*args, **kwargs)
-
+            # Mask support (conservative): accept only boolean (or 0/1) key-padding masks [B, Nk]
             mask_bool = None
-            if torch.is_tensor(mask):
-                if mask.dim() == 2 and mask.shape[0] == b and mask.shape[1] == q_bhnd.shape[-2]:
+            if mask is not None:
+                if not torch.is_tensor(mask):
+                    if fallback_override is not None:
+                        return fallback_override(func, *args, **kwargs)
+                    return func(*args, **kwargs)
+
+                # bool mask is typically [B, Nk] (or [1, Nk])
+                if mask.dim() == 2 and mask.shape[1] == n and mask.shape[0] in (1, b):
+                    if mask.shape[0] == 1 and b > 1:
+                        mask = mask.expand(b, -1)
                     mask_bool = _as_bool_mask(mask)
+                    if mask_bool is None:
+                        if fallback_override is not None:
+                            return fallback_override(func, *args, **kwargs)
+                        return func(*args, **kwargs)
                 else:
                     # Unsupported mask shape/type; fall back.
-                    return orig_fn(*args, **kwargs)
+                    if fallback_override is not None:
+                        return fallback_override(func, *args, **kwargs)
+                    return func(*args, **kwargs)
 
             t0 = _now_ms() if cfg.verbose else 0
-            out = monarch(q_bhnd, k_bhnd, v_bhnd, attention_mask=mask_bool)
-            out = out.to(dtype=v.dtype)
-            out = out.contiguous()
-            out = _reshape_back(out, q)
+            out_bhnd = monarch(q_bhnd, k_bhnd, v_bhnd, attention_mask=mask_bool)
+            out_bhnd = out_bhnd.to(dtype=v.dtype).contiguous()
+
+            if skip_output_reshape:
+                out = out_bhnd
+            else:
+                out = out_bhnd.permute(0, 2, 1, 3).reshape(b, -1, heads * dim_head)
 
             if cfg.verbose:
                 dt = _now_ms() - t0
-                _PATCH_STATE["last_status"] = (
-                    f"monarch({cfg.impl}->{impl}) used: n={q_bhnd.shape[-2]} h={h} bs={cfg.block_size} "
+                _STATE["last_status"] = (
+                    f"monarch(model-override, {cfg.impl}->{impl}) used: n={n} h={heads} bs={cfg.block_size} "
                     f"steps={cfg.num_steps} pad={cfg.pad_type} | {dt}ms"
                 )
 
             return out
         except Exception:
-            # Any failure must be non-fatal: fall back to original attention.
-            return orig_fn(*args, **kwargs)
+            if fallback_override is not None:
+                return fallback_override(func, *args, **kwargs)
+            return func(*args, **kwargs)
 
-    # Preserve a few useful attributes
-    wrapped.__name__ = getattr(orig_fn, "__name__", "optimized_attention")
-    wrapped.__doc__ = getattr(orig_fn, "__doc__", None)
-    wrapped.__wrapped__ = orig_fn  # type: ignore
-    return wrapped
+    return attention_override
 
 
-def enable_monarch_attention(cfg: _PatchConfig) -> str:
-    """Patch ComfyUI attention functions (global) to use MonarchAttention for self-attn."""
-    # Import comfy lazily so this file can be syntax-checked outside ComfyUI.
-    import importlib
+def _apply_model_override(model, cfg: _PatchConfig):
+    """Return (model_clone, status) with optimized_attention_override set."""
+    model_clone = model.clone()
+    model_options = getattr(model_clone, "model_options", None)
+    if model_options is None:
+        # should not happen for a ComfyUI MODEL, but keep it robust
+        model_clone.model_options = {}
+        model_options = model_clone.model_options
 
-    attn_mod = importlib.import_module("comfy.ldm.modules.attention")
+    transformer_options = model_options.get("transformer_options")
+    if transformer_options is None or not isinstance(transformer_options, dict):
+        transformer_options = {}
+        model_options["transformer_options"] = transformer_options
 
-    if _PATCH_STATE["enabled"]:
-        # Update config by re-wrapping
-        disable_monarch_attention()
+    prev_key = "_monarch_prev_optimized_attention_override"
+    current = transformer_options.get("optimized_attention_override", None)
+    # Only treat the current override as "previous" if it is NOT already ours.
+    if not getattr(current, "_monarch_override", False):
+        transformer_options[prev_key] = current
 
-    orig: dict[str, Callable] = {}
+    fallback_override = transformer_options.get(prev_key, None)
+    override = _build_attention_override(cfg, fallback_override)
+    # Tag it so Disable doesn't nuke someone else's override.
+    setattr(override, "_monarch_override", True)
+    setattr(override, "_monarch_cfg", (cfg.impl, cfg.block_size, cfg.num_steps, cfg.pad_type, cfg.min_seq_len, cfg.max_seq_len))
 
-    # Patch the most common entry points (only those that exist)
-    candidate_names = [
-        "optimized_attention",
-        "attention_basic",
-        "attention_pytorch",
-        "attention",  # some forks
-    ]
+    transformer_options["optimized_attention_override"] = override
+    transformer_options["_monarch_attention_cfg"] = {
+        "impl": cfg.impl,
+        "block_size": cfg.block_size,
+        "num_steps": cfg.num_steps,
+        "pad_type": cfg.pad_type,
+        "min_seq_len": cfg.min_seq_len,
+        "max_seq_len": cfg.max_seq_len,
+        "verbose": cfg.verbose,
+    }
 
-    for name in candidate_names:
-        fn = getattr(attn_mod, name, None)
-        if callable(fn):
-            orig[name] = fn
-            setattr(attn_mod, name, _build_wrapper(fn, cfg))
-
-    if not orig:
-        _PATCH_STATE["enabled"] = False
-        _PATCH_STATE["orig"] = {}
-        _PATCH_STATE["config"] = None
-        _PATCH_STATE["last_status"] = "No patch targets found in comfy.ldm.modules.attention"
-        return _PATCH_STATE["last_status"]
-
-    _PATCH_STATE["enabled"] = True
-    _PATCH_STATE["orig"] = orig
-    _PATCH_STATE["config"] = cfg
-    _PATCH_STATE["last_status"] = (
-        f"enabled (patched: {', '.join(sorted(orig.keys()))}) | impl={cfg.impl} bs={cfg.block_size} "
-        f"steps={cfg.num_steps} pad={cfg.pad_type} n=[{cfg.min_seq_len},{cfg.max_seq_len}]"
+    status = (
+        f"enabled (model override) | impl={cfg.impl} bs={cfg.block_size} steps={cfg.num_steps} "
+        f"pad={cfg.pad_type} n=[{cfg.min_seq_len},{cfg.max_seq_len}]"
     )
-    return _PATCH_STATE["last_status"]
+    _STATE["last_status"] = status
+    return model_clone, status
 
 
-def disable_monarch_attention() -> str:
-    """Restore original ComfyUI attention functions."""
-    if not _PATCH_STATE["enabled"]:
-        _PATCH_STATE["last_status"] = "disabled"
-        return _PATCH_STATE["last_status"]
+def _remove_model_override(model):
+    """Return (model_clone, status) with optimized_attention_override restored/removed."""
+    model_clone = model.clone()
+    model_options = getattr(model_clone, "model_options", None)
+    if model_options is None:
+        model_clone.model_options = {}
+        model_options = model_clone.model_options
 
-    import importlib
+    transformer_options = model_options.get("transformer_options")
+    if transformer_options is None or not isinstance(transformer_options, dict):
+        transformer_options = {}
+        model_options["transformer_options"] = transformer_options
 
-    attn_mod = importlib.import_module("comfy.ldm.modules.attention")
-    orig: dict[str, Callable] = _PATCH_STATE.get("orig", {}) or {}
+    prev_key = "_monarch_prev_optimized_attention_override"
+    current = transformer_options.get("optimized_attention_override", None)
+    # If the current override is not Monarch, do nothing (don't break other attention nodes).
+    if not getattr(current, "_monarch_override", False):
+        # But do clean up any stale keys we may have left behind.
+        transformer_options.pop(prev_key, None)
+        transformer_options.pop("_monarch_attention_cfg", None)
+        status = "no monarch override present (no-op)"
+        _STATE["last_status"] = status
+        return model_clone, status
 
-    for name, fn in orig.items():
-        try:
-            setattr(attn_mod, name, fn)
-        except Exception:
-            pass
+    prev = transformer_options.pop(prev_key, None)
+    transformer_options.pop("_monarch_attention_cfg", None)
 
-    _PATCH_STATE["enabled"] = False
-    _PATCH_STATE["orig"] = {}
-    _PATCH_STATE["config"] = None
-    _PATCH_STATE["last_status"] = "disabled"
-    return _PATCH_STATE["last_status"]
+    if prev is None:
+        # We were enabled without a prior override; just remove ours.
+        transformer_options.pop("optimized_attention_override", None)
+    else:
+        transformer_options["optimized_attention_override"] = prev
+
+    status = "disabled (model override removed)"
+    _STATE["last_status"] = status
+    return model_clone, status
 
 
 # ------------------------------
@@ -349,20 +398,21 @@ class MonarchAttentionEnable:
         max_seq_len: int,
         verbose: bool,
     ):
-        if enable:
-            cfg = _PatchConfig(
-                impl=str(impl),
-                block_size=int(block_size),
-                num_steps=int(num_steps),
-                pad_type=str(pad_type),
-                min_seq_len=int(min_seq_len),
-                max_seq_len=int(max_seq_len),
-                verbose=bool(verbose),
-            )
-            status = enable_monarch_attention(cfg)
-        else:
-            status = disable_monarch_attention()
-        return (model, status)
+        if not enable:
+            model2, status = _remove_model_override(model)
+            return (model2, status)
+
+        cfg = _PatchConfig(
+            impl=str(impl),
+            block_size=int(block_size),
+            num_steps=int(num_steps),
+            pad_type=str(pad_type),
+            min_seq_len=int(min_seq_len),
+            max_seq_len=int(max_seq_len),
+            verbose=bool(verbose),
+        )
+        model2, status = _apply_model_override(model, cfg)
+        return (model2, status)
 
 
 class MonarchAttentionDisable:
@@ -380,8 +430,8 @@ class MonarchAttentionDisable:
     CATEGORY = "attention/monarch"
 
     def apply(self, model):
-        status = disable_monarch_attention()
-        return (model, status)
+        model2, status = _remove_model_override(model)
+        return (model2, status)
 
 
 class MonarchAttentionStatus:
@@ -395,7 +445,7 @@ class MonarchAttentionStatus:
     CATEGORY = "attention/monarch"
 
     def get(self):
-        return (str(_PATCH_STATE.get("last_status", "disabled")),)
+        return (str(_STATE.get("last_status", "disabled")),)
 
 
 NODE_CLASS_MAPPINGS = {
