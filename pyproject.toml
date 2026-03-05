@@ -28,7 +28,7 @@ Documentation = "https://github.com/xmarre/ComfyUI_Monarch_Attention/wiki"
 "Bug Tracker" = "https://github.com/xmarre/ComfyUI_Monarch_Attention/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "xmarre"
 DisplayName = "ComfyUI_Monarch_Attention"
 Icon = ""
 includes = [] 
