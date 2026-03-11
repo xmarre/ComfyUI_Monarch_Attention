@@ -10,14 +10,7 @@ That means it only affects the **MODEL branch** you connect it to (SDXL UNet bra
 
    `ComfyUI/custom_nodes/comfyui_monarch_attention/`
 
-2. Vendor the MonarchAttention repo into this custom node (no env vars needed).
-
-   Copy (or git clone) the MonarchAttention repo so that `ma/` ends up at one of:
-
-   - `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch_attention/ma/`
-   - `ComfyUI/custom_nodes/comfyui_monarch_attention/third_party/monarch-attention/ma/`
-
-3. Restart ComfyUI.
+   Or install via ComfyUI-Manager
 
 ## Use
 
